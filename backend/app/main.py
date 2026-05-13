@@ -1,0 +1,136 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
+import pyspark
+from pyspark.sql import SparkSession
+from fastapi.middleware.cors import CORSMiddleware
+import os
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("VisualSpark") \
+    .config("spark.driver.host", "localhost") \
+    .getOrCreate()
+
+class Node(BaseModel):
+    id: str
+    type: str
+    data: Dict[str, Any]
+
+class Edge(BaseModel):
+    id: str
+    source: str
+    target: str
+
+class Pipeline(BaseModel):
+    nodes: List[Node]
+    edges: List[Edge]
+
+@app.get("/")
+def read_root():
+    return {"message": "Visual Spark Backend Running"}
+
+@app.post("/run")
+async def run_pipeline(pipeline: Pipeline):
+    try:
+        # Build adjacency list and in-degree map
+        adj = {node.id: [] for node in pipeline.nodes}
+        in_degree = {node.id: 0 for node in pipeline.nodes}
+        for edge in pipeline.edges:
+            adj[edge.source].append(edge.target)
+            in_degree[edge.target] += 1
+
+        # Map of node id to its output DataFrame
+        outputs = {}
+        # Final result to return (e.g. from display nodes)
+        final_results = {}
+
+        queue = [node.id for node in pipeline.nodes if in_degree[node.id] == 0]
+        node_map = {node.id: node for node in pipeline.nodes}
+
+        executed_nodes = []
+
+        while queue:
+            # Sort queue to ensure deterministic execution if needed
+            queue.sort()
+            curr_id = queue.pop(0)
+            node = node_map[curr_id]
+
+            # Find all parent nodes that have outputs
+            parents = [e.source for e in pipeline.edges if e.target == curr_id]
+            parent_outputs = [outputs[p] for p in parents if p in outputs]
+
+            # Execute node logic based on type
+            if node.type == 'csv_reader':
+                path = node.data.get('path', 'data.csv')
+                if not os.path.exists(path):
+                     # Try to see if it's in the current dir
+                     path = os.path.join(os.getcwd(), path)
+                outputs[curr_id] = spark.read.csv(path, header=True, inferSchema=True)
+
+            elif node.type == 'filter':
+                condition = node.data.get('condition')
+                if not parent_outputs:
+                    raise HTTPException(status_code=400, detail=f"No input for filter node {curr_id}")
+                if condition:
+                    outputs[curr_id] = parent_outputs[0].filter(condition)
+                else:
+                    outputs[curr_id] = parent_outputs[0]
+
+            elif node.type == 'select':
+                columns = node.data.get('columns', [])
+                if not parent_outputs:
+                    raise HTTPException(status_code=400, detail=f"No input for select node {curr_id}")
+                if columns:
+                    outputs[curr_id] = parent_outputs[0].select(*columns)
+                else:
+                    outputs[curr_id] = parent_outputs[0]
+
+            elif node.type == 'display':
+                if not parent_outputs:
+                    raise HTTPException(status_code=400, detail=f"No input for display node {curr_id}")
+                # For display, we just take 10 rows
+                data = parent_outputs[0].limit(10).toPandas().to_dict(orient='records')
+                final_results[curr_id] = data
+                outputs[curr_id] = parent_outputs[0] # Pass through
+
+            executed_nodes.append(curr_id)
+            for neighbor in adj[curr_id]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        # If there's only one display result, return it directly in "data" for backward compatibility if needed,
+        # but better to return all results.
+        # Given the previous curl expected a "data" field in some version, let's include it.
+
+        response = {
+            "status": "success",
+            "executed": executed_nodes,
+            "results": final_results
+        }
+
+        if final_results:
+            # Pick the last display node's result as top-level "data"
+            last_display_id = [n_id for n_id in executed_nodes if n_id in final_results][-1]
+            response["data"] = final_results[last_display_id]
+
+        return response
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
